@@ -1,0 +1,86 @@
+########################################################################
+# NetworkPolicy — default-deny, explicit allow per workload
+# PCI-DSS 1.2.1 / NIST CSF PR.AC-5
+########################################################################
+{{- if .Values.networkPolicy.enabled }}
+
+# Ingestor: receives from ingress, reaches Aurora + Redis + SQS (via NAT)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: veritas-ingestor
+  namespace: {{ .Release.Namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: veritas-ingestor
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.ingressAllowNamespaceSelector | nindent 12 }}
+      ports:
+        - port: 8080
+          protocol: TCP
+  egress:
+    - ports: [{ port: 53, protocol: UDP }, { port: 53, protocol: TCP }]  # DNS
+    - ports: [{ port: 5432, protocol: TCP }]   # Aurora PostgreSQL
+    - ports: [{ port: 6379, protocol: TCP }]   # Redis
+    - ports: [{ port: 443, protocol: TCP }]    # SQS + Secrets Manager + KMS (HTTPS via NAT)
+---
+# Reporter: no inbound HTTP, reaches Aurora (read) + SQS + S3 + regulatory endpoint
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: veritas-reporter
+  namespace: {{ .Release.Namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: veritas-reporter
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # Health checks only from kubelet
+    - ports:
+        - port: 8080
+          protocol: TCP
+  egress:
+    - ports: [{ port: 53, protocol: UDP }, { port: 53, protocol: TCP }]  # DNS
+    - ports: [{ port: 5432, protocol: TCP }]   # Aurora read replica
+    - ports: [{ port: 443, protocol: TCP }]    # SQS, S3, Secrets Manager, regulatory repo (HTTPS)
+{{- end }}
+---
+########################################################################
+# ConfigMap — non-sensitive runtime config
+# PCI-DSS 3.2 — no secrets here; use Secrets Manager
+########################################################################
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: veritas-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "veritas.labels" . | nindent 4 }}
+data:
+  APP_ENV:              "{{ .Values.global.environment }}"
+  AWS_REGION:           "{{ .Values.global.region }}"
+  LOG_FORMAT:           "{{ .Values.global.logFormat }}"
+  TLS_MIN_VERSION:      "{{ .Values.global.tlsMinVersion }}"
+
+  # Trade processing config
+  UTI_PREFIX:           "VRTS"
+  UTI_REDIS_TTL_HOURS:  "72"       # UTI dedup window — 72h covers T+1 + weekend
+  MAX_BATCH_SIZE:       "500"
+
+  # MiFID II reporting schema version
+  MIFID2_SCHEMA:        "rts22-v3"
+  EMIR_SCHEMA:          "refit-v2"
+
+  # Regulatory endpoints (non-sensitive — URLs only)
+  MIFID2_ARM_ENDPOINT:  "https://arm.regulatory-provider.example.com/v2"
+  EMIR_TR_ENDPOINT:     "https://tr.regulatory-provider.example.com/v2"
+
+  # Report archival prefixes
+  S3_REPORT_PREFIX:     "reports/"
+  S3_RECEIPT_PREFIX:    "receipts/"
+  S3_REJECTION_PREFIX:  "rejections/"

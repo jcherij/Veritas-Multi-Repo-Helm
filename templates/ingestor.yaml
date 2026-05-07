@@ -1,0 +1,124 @@
+########################################################################
+# Ingestor Deployment
+# Validates incoming trades, deduplicates UTIs via Redis,
+# writes to Aurora trade ledger, publishes to submission queue.
+########################################################################
+{{- if .Values.ingestor.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "veritas.ingestor.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "veritas.labels" . | nindent 4 }}
+    {{- include "veritas.ingestor.selectorLabels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.ingestor.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "veritas.ingestor.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        {{- include "veritas.ingestor.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "veritas.ingestor.fullname" . }}
+      automountServiceAccountToken: true
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ingestor
+          image: "{{ .Values.image.repository }}/ingestor:{{ .Values.ingestor.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            {{- toYaml .Values.ingestor.env | nindent 12 }}
+          livenessProbe:
+            {{- toYaml .Values.ingestor.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.ingestor.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.ingestor.resources | nindent 12 }}
+          volumeMounts:
+            {{- toYaml .Values.volumeMounts | nindent 12 }}
+      volumes:
+        {{- toYaml .Values.volumes | nindent 8 }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values: [veritas-ingestor]
+              topologyKey: kubernetes.io/hostname
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "veritas.ingestor.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "veritas.labels" . | nindent 4 }}
+  annotations:
+    {{- toYaml .Values.ingestor.serviceAccount.annotations | nindent 4 }}
+automountServiceAccountToken: true
+---
+{{- if .Values.ingestor.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "veritas.ingestor.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "veritas.ingestor.fullname" . }}
+  minReplicas: {{ .Values.ingestor.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.ingestor.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.ingestor.autoscaling.targetCPUUtilizationPercentage }}
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+{{- end }}
+---
+{{- if .Values.ingestor.podDisruptionBudget }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "veritas.ingestor.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  minAvailable: {{ .Values.ingestor.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "veritas.ingestor.selectorLabels" . | nindent 6 }}
+{{- end }}
+{{- end }}

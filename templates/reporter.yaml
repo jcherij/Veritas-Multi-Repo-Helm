@@ -1,0 +1,179 @@
+########################################################################
+# Reporter Deployment
+# Generates regulatory reports (MiFID II RTS 22 / EMIR XML),
+# submits to trade repositories, archives to S3, records receipts.
+########################################################################
+{{- if .Values.reporter.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "veritas.reporter.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "veritas.labels" . | nindent 4 }}
+    {{- include "veritas.reporter.selectorLabels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.reporter.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "veritas.reporter.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        {{- include "veritas.reporter.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "veritas.reporter.fullname" . }}
+      automountServiceAccountToken: true
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: reporter
+          image: "{{ .Values.image.repository }}/reporter:{{ .Values.reporter.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            {{- toYaml .Values.reporter.env | nindent 12 }}
+          livenessProbe:
+            {{- toYaml .Values.reporter.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.reporter.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.reporter.resources | nindent 12 }}
+          volumeMounts:
+            {{- toYaml .Values.volumeMounts | nindent 12 }}
+      volumes:
+        {{- toYaml .Values.volumes | nindent 8 }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values: [veritas-reporter]
+              topologyKey: kubernetes.io/hostname
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "veritas.reporter.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "veritas.labels" . | nindent 4 }}
+  annotations:
+    {{- toYaml .Values.reporter.serviceAccount.annotations | nindent 4 }}
+automountServiceAccountToken: true
+---
+{{- if .Values.reporter.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "veritas.reporter.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "veritas.reporter.fullname" . }}
+  minReplicas: {{ .Values.reporter.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.reporter.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.reporter.autoscaling.targetCPUUtilizationPercentage }}
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 600  # Reporter — longer window, avoid mid-batch scale-down
+{{- end }}
+---
+{{- if .Values.reporter.podDisruptionBudget }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "veritas.reporter.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  minAvailable: {{ .Values.reporter.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "veritas.reporter.selectorLabels" . | nindent 6 }}
+{{- end }}
+---
+########################################################################
+# Scheduled Report CronJob — T+1 end-of-day batch
+# MiFID II: trades executed today must be reported by next business day
+########################################################################
+{{- if .Values.reporter.scheduledReport.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: veritas-eod-report
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "veritas.labels" . | nindent 4 }}
+    app.kubernetes.io/component: eod-reporter
+spec:
+  schedule: {{ .Values.reporter.scheduledReport.schedule | quote }}
+  suspend: {{ .Values.reporter.scheduledReport.suspend }}
+  concurrencyPolicy: Forbid   # Never run two EOD batches simultaneously
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 10  # Keep failure history for audit — MiFID II
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 7200  # 2 hour max — must complete before next trading day
+      template:
+        metadata:
+          labels:
+            {{- include "veritas.reporter.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: eod-reporter
+        spec:
+          serviceAccountName: {{ include "veritas.reporter.fullname" . }}
+          restartPolicy: OnFailure
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: eod-reporter
+              image: "{{ .Values.image.repository }}/reporter:{{ .Values.reporter.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              command: ["/app/bin/reporter", "--mode=eod-batch"]
+              env:
+                {{- toYaml .Values.reporter.env | nindent 16 }}
+                - name: REPORT_MODE
+                  value: "eod-batch"
+                - name: BATCH_DATE
+                  value: "today"
+              resources:
+                requests:
+                  cpu: "1000m"
+                  memory: "2Gi"
+                limits:
+                  cpu: "4000m"
+                  memory: "4Gi"
+              volumeMounts:
+                {{- toYaml .Values.volumeMounts | nindent 16 }}
+          volumes:
+            {{- toYaml .Values.volumes | nindent 12 }}
+{{- end }}
+{{- end }}
