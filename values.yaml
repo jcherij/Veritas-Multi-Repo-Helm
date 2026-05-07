@@ -1,0 +1,211 @@
+########################################################################
+# Veritas — Helm values
+# All AWS resource coordinates (endpoints, ARNs, queue URLs) are
+# injected at deploy time from Terraform outputs — not hardcoded here.
+########################################################################
+
+global:
+  environment: production
+  region: us-east-1
+  logFormat: json         # Structured logs — feeds SIEM
+  tlsMinVersion: "TLS1_2" # PCI-DSS 4.2.1
+
+image:
+  repository: YOUR_ACCOUNT.dkr.ecr.us-east-1.amazonaws.com/veritas
+  pullPolicy: IfNotPresent
+
+########################################################################
+# Ingestor
+# Consumes trade events from SQS, validates, enriches via Redis cache,
+# writes confirmed trades to Aurora. Publishes to submission queue.
+########################################################################
+ingestor:
+  enabled: true
+  tag: "1.0.0"
+
+  replicaCount: 3       # Spread across 3 AZs
+
+  serviceAccount:
+    create: true
+    annotations:
+      eks.amazonaws.com/role-arn: "INGESTOR_ROLE_ARN"  # Injected from TF output
+      eks.amazonaws.com/token-expiration-seconds: "3600"
+
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
+
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 12       # Scale for spikes (large trade file drops, end-of-day)
+    targetCPUUtilizationPercentage: 65
+
+  podDisruptionBudget:
+    minAvailable: 2       # Never lose quorum during maintenance
+
+  env:
+    # Endpoints injected at deploy — never hardcoded
+    - name: TRADE_QUEUE_URL
+      value: "TRADE_EVENTS_QUEUE_URL"
+    - name: SUBMISSION_QUEUE_URL
+      value: "SUBMISSION_EVENTS_QUEUE_URL"
+    - name: REDIS_HOST
+      value: "REDIS_PRIMARY_ENDPOINT"
+    - name: DB_HOST
+      valueFrom:
+        secretKeyRef:
+          name: veritas-aurora-secret
+          key: host
+    - name: DB_READER_HOST
+      valueFrom:
+        secretKeyRef:
+          name: veritas-aurora-secret
+          key: reader_host
+    - name: DB_NAME
+      value: "trade_ledger"
+    - name: UTI_PREFIX
+      value: "VRTS"           # Unique Trade Identifier prefix (EMIR/MiFID II)
+    - name: MAX_BATCH_SIZE
+      value: "500"
+    - name: PROCESSING_TIMEOUT_SECONDS
+      value: "240"
+
+  livenessProbe:
+    httpGet: { path: /healthz, port: 8080 }
+    initialDelaySeconds: 20
+    periodSeconds: 30
+
+  readinessProbe:
+    httpGet: { path: /readyz, port: 8080 }
+    initialDelaySeconds: 10
+    periodSeconds: 15
+
+########################################################################
+# Reporter
+# Reads from submission queue, generates regulatory report files
+# (MiFID II RTS 22, EMIR XML), submits to trade repositories,
+# archives to S3, records submission receipts.
+########################################################################
+reporter:
+  enabled: true
+  tag: "1.0.0"
+
+  replicaCount: 2
+
+  serviceAccount:
+    create: true
+    annotations:
+      eks.amazonaws.com/role-arn: "REPORTER_ROLE_ARN"
+      eks.amazonaws.com/token-expiration-seconds: "3600"
+
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"       # Report generation is memory-intensive (large XML builds)
+    limits:
+      cpu: "2000m"
+      memory: "2Gi"
+
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+
+  podDisruptionBudget:
+    minAvailable: 1
+
+  env:
+    - name: SUBMISSION_QUEUE_URL
+      value: "SUBMISSION_EVENTS_QUEUE_URL"
+    - name: REGULATORY_ARCHIVE_BUCKET
+      value: "REGULATORY_ARCHIVE_BUCKET"
+    - name: DB_READER_HOST
+      valueFrom:
+        secretKeyRef:
+          name: veritas-aurora-secret
+          key: reader_host
+    - name: DB_NAME
+      value: "trade_ledger"
+    - name: REPORT_FORMAT
+      value: "mifid2-rts22"    # Switch to emir-xml for EMIR submissions
+    - name: SUBMISSION_ENDPOINT
+      value: "https://reporting.regulatoryrepo.example.com/v2/submit"
+    - name: SUBMISSION_TIMEOUT_SECONDS
+      value: "30"
+    - name: MAX_RETRY_ATTEMPTS
+      value: "5"               # MiFID II: rejected reports must be resubmitted
+    - name: ARCHIVE_PREFIX
+      value: "reports/"
+
+  livenessProbe:
+    httpGet: { path: /healthz, port: 8080 }
+    initialDelaySeconds: 20
+    periodSeconds: 30
+
+  readinessProbe:
+    httpGet: { path: /readyz, port: 8080 }
+    initialDelaySeconds: 10
+    periodSeconds: 15
+
+  # CronJob for scheduled end-of-day T+1 reporting batch
+  scheduledReport:
+    enabled: true
+    schedule: "0 18 * * 1-5"  # 18:00 UTC weekdays — after market close
+    suspend: false
+
+########################################################################
+# Shared pod hardening — applied to both ingestor and reporter
+# PCI-DSS 2.2 / SOC 2 CC6.1
+########################################################################
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+  runAsNonRoot: true
+  runAsUser: 10001
+
+volumes:
+  - name: tmp
+    emptyDir: {}
+  - name: reports-scratch
+    emptyDir:
+      medium: Memory    # In-memory scratch for report assembly — never hits disk
+      sizeLimit: 512Mi
+
+volumeMounts:
+  - name: tmp
+    mountPath: /tmp
+  - name: reports-scratch
+    mountPath: /app/scratch
+
+########################################################################
+# Network Policy
+########################################################################
+networkPolicy:
+  enabled: true
+  ingressAllowNamespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: ingress-nginx
+
+########################################################################
+# Topology spread — AZ distribution
+########################################################################
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule

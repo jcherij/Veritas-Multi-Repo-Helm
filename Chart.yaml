@@ -1,0 +1,21 @@
+apiVersion: v2
+name: veritas
+description: |
+  Veritas Trade Reporting Platform — Kubernetes workloads.
+  Two services: ingestor (trade intake + validation) and
+  reporter (regulatory submission + archival).
+  AWS resources (Aurora, SQS, Redis, S3) managed separately in Terraform.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+
+keywords:
+  - trade-reporting
+  - mifid2
+  - emir
+  - dodd-frank
+  - financial-services
+
+maintainers:
+  - name: Veritas Platform Team
+    email: platform@example.com
